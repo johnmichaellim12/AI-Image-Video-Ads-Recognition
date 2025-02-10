@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch import nn, optim
-from nsfw_detector import predict
+
 
 # Load YOLOv8 model (pretrained on COCO dataset)
 yolo_model = YOLO("yolov8n.pt")
@@ -23,41 +23,47 @@ blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning
 blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 
 # # Load NSFW detection model
-# nsfw_model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
-# nsfw_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
+nsfw_model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
+nsfw_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # Load NSFW detection model
-nsfw_model = predict.load_model("nsfw_mobilenet_v2.pb")  # Using a dedicated NSFW detection model
+# nsfw_model = predict.load_model("nsfw_mobilenet_v2.pb")  # Using a dedicated NSFW detection model
 
-def move_nsfw_file(frame_path):
-    """Move NSFW file only if it doesn't already exist in the NSFW folder."""
-    new_path = os.path.join("output/nsfw", os.path.basename(frame_path))
-    if not os.path.exists(new_path):
-        os.rename(frame_path, new_path)
-    else:
-        print(f"⚠️ NSFW file already exists: {new_path}, skipping rename.")
+def move_nsfw_file(frame_path, frame_number):
+    """Move NSFW file to the NSFW folder with a unique name if it already exists."""
+    base_name, ext = os.path.splitext(os.path.basename(frame_path))
+    new_path = os.path.join("output/nsfw", f"{base_name}_frame_{frame_number}{ext}")
+    
+    # Ensure the filename is unique
+    counter = 1
+    while os.path.exists(new_path):
+        new_path = os.path.join("output/nsfw", f"{base_name}_frame_{frame_number}_{counter}{ext}")
+        counter += 1
+
+    os.rename(frame_path, new_path)
+    print(f"🚨 NSFW file moved to {new_path}")
 
 # # NSFW Detection Function
-# def is_nsfw(image_path):
-#     """Detect if an image contains NSFW content."""
-#     image = Image.open(image_path).convert("RGB")
-#     inputs = nsfw_processor(images=image, return_tensors="pt")
-#     outputs = nsfw_model(**inputs)
-#     probs = outputs.logits.softmax(dim=-1).detach().numpy()[0]
-#     nsfw_score = probs[1]  # Assuming index 1 is NSFW probability
-#     return nsfw_score > 0.5  # Flag as NSFW if above 50%
+def is_nsfw(image_path):
+    """Detect if an image contains NSFW content."""
+    image = Image.open(image_path).convert("RGB")
+    inputs = nsfw_processor(images=image, return_tensors="pt")
+    outputs = nsfw_model(**inputs)
+    probs = outputs.logits.softmax(dim=-1).detach().numpy()[0]
+    nsfw_score = probs[1]  # Assuming index 1 is NSFW probability
+    return nsfw_score > 0.5  # Flag as NSFW if above 50%
 
 
 # NSFW Detection Function
-def is_nsfw(image_path):
-    """Detect if an image contains NSFW content using a specialized NSFW model."""
-    predictions = predict.classify(nsfw_model, image_path)
-    nsfw_score = predictions[image_path]['porn'] + predictions[image_path]['sexy']  # Summing probabilities
-    if nsfw_score > 0.5:
-        print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_score:.2f})")
-        move_nsfw_file(image_path)
-        return True
-    return False
+# def is_nsfw(image_path):
+#     """Detect if an image contains NSFW content using a specialized NSFW model."""
+#     predictions = predict.classify(nsfw_model, image_path)
+#     nsfw_score = predictions[image_path]['porn'] + predictions[image_path]['sexy']  # Summing probabilities
+#     if nsfw_score > 0.5:
+#         print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_score:.2f})")
+#         move_nsfw_file(image_path)
+#         return True
+#     return False
 
 # Define dataset class
 class NSFWImageDataset(Dataset):
@@ -144,21 +150,21 @@ def prompt_user_for_review(image_path, caption, category):
     user_input = input(f"❓ Does this ad match the category '{category}'? (y/n): {caption}\n")
     return user_input.lower() == 'y'
 
-def is_relevant_ad(caption, category):
-    """Check if the generated caption is relevant to the chosen category using similarity scoring."""
-    if category.lower() not in ALLOWED_CATEGORIES:
-        print("⚠️ Invalid category provided. Available categories:", list(ALLOWED_CATEGORIES.keys()))
-        return False
+# def is_relevant_ad(caption, category):
+#     """Check if the generated caption is relevant to the chosen category using similarity scoring."""
+#     if category.lower() not in ALLOWED_CATEGORIES:
+#         print("⚠️ Invalid category provided. Available categories:", list(ALLOWED_CATEGORIES.keys()))
+#         return False
     
-    category_description = ALLOWED_CATEGORIES[category.lower()]
-    similarity_score = compute_similarity(caption, category_description)
+#     category_description = ALLOWED_CATEGORIES[category.lower()]
+#     similarity_score = compute_similarity(caption, category_description)
     
-    print(f"🔎 Similarity Score ({category}): {similarity_score:.2f}")
+#     print(f"🔎 Similarity Score ({category}): {similarity_score:.2f}")
     
-    if similarity_score < SIMILARITY_THRESHOLD:
-        return prompt_user_for_review(caption, category)
+#     if similarity_score < SIMILARITY_THRESHOLD:
+#         return prompt_user_for_review(caption, category)
     
-    return similarity_score >= SIMILARITY_THRESHOLD
+#     return similarity_score >= SIMILARITY_THRESHOLD
 
 
 def detect_objects(image_path, output_folder):
@@ -221,15 +227,10 @@ def process_video(video_path, category):
             cv2.imwrite(frame_path, frame)
             if os.path.exists(frame_path):
                 if is_nsfw(frame_path):
-                    if frame_path not in processed_frames:
-                        print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
-                        processed_frames.add(frame_path)
-                    new_path = os.path.join("output/nsfw", os.path.basename(frame_path))
-                    if not os.path.exists(new_path):
-                        os.rename(frame_path, new_path)
-                    else:
-                        print(f"⚠️ NSFW file already exists: {new_path}, skipping rename.")
+                    print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
+                    move_nsfw_file(frame_path, frame_count)
                     continue
+
                 caption = generate_image_caption(frame_path)
                 captions.append(caption)
                 print(f"🖼️ Processed frame {frame_count}: {caption}")
