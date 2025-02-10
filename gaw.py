@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch import nn, optim
+from nudenet import NudeClassifier
+from deepstack_sdk import ServerConfig, Detection
 
 
 # Load YOLOv8 model (pretrained on COCO dataset)
@@ -29,6 +31,14 @@ nsfw_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
 # Load NSFW detection model
 # nsfw_model = predict.load_model("nsfw_mobilenet_v2.pb")  # Using a dedicated NSFW detection model
 
+# Load NSFW detection models
+nsfw_classifier = NudeClassifier()
+
+# If using Deepstack (run Deepstack locally first: `docker run -d -p 5000:5000 deepquestai/deepstack`)
+DEEPSTACK_URL = "http://localhost:5000"
+deepstack_config = ServerConfig(DEEPSTACK_URL)
+deepstack_detector = Detection(deepstack_config)
+
 def move_nsfw_file(frame_path, frame_number):
     """Move NSFW file to the NSFW folder with a unique name if it already exists."""
     base_name, ext = os.path.splitext(os.path.basename(frame_path))
@@ -43,16 +53,36 @@ def move_nsfw_file(frame_path, frame_number):
     os.rename(frame_path, new_path)
     print(f"🚨 NSFW file moved to {new_path}")
 
-# # NSFW Detection Function
+# # # NSFW Detection Function
+# def is_nsfw(image_path):
+#     """Detect if an image contains NSFW content."""
+#     image = Image.open(image_path).convert("RGB")
+#     inputs = nsfw_processor(images=image, return_tensors="pt")
+#     outputs = nsfw_model(**inputs)
+#     probs = outputs.logits.softmax(dim=-1).detach().numpy()[0]
+#     nsfw_score = probs[1]  # Assuming index 1 is NSFW probability
+#     return nsfw_score > 0.5  # Flag as NSFW if above 50%
+
 def is_nsfw(image_path):
     """Detect if an image contains NSFW content."""
-    image = Image.open(image_path).convert("RGB")
-    inputs = nsfw_processor(images=image, return_tensors="pt")
-    outputs = nsfw_model(**inputs)
-    probs = outputs.logits.softmax(dim=-1).detach().numpy()[0]
-    nsfw_score = probs[1]  # Assuming index 1 is NSFW probability
-    return nsfw_score > 0.5  # Flag as NSFW if above 50%
+    
+    # Step 1: NudeNet Classification
+    results = nsfw_classifier.classify(image_path)
+    nsfw_prob = results[image_path].get('porn', 0) + results[image_path].get('sexy', 0)
 
+    # Step 2: DeepStack NSFW (if available)
+    try:
+        response = deepstack_detector.detectObject(image_path, min_confidence=0.6)
+        ds_nsfw = any(obj['label'] == 'nudity' for obj in response["predictions"])
+    except Exception:
+        ds_nsfw = False  # If DeepStack isn't running, ignore it.
+
+    # Step 3: Decision Based on Threshold
+    if nsfw_prob > 0.5 or ds_nsfw:
+        print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_prob:.2f})")
+        return True
+    
+    return False
 
 # NSFW Detection Function
 # def is_nsfw(image_path):
@@ -214,9 +244,8 @@ def process_video(video_path, category):
     """Extract frames from video and analyze content."""
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
-    captions = []
-    processed_frames = set()
-    
+    nsfw_detected = False
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -225,26 +254,20 @@ def process_video(video_path, category):
         if frame_count % 30 == 0:  # Process one frame per second (assuming 30 FPS)
             frame_path = os.path.join("output/frames", f"{os.path.basename(video_path)}_frame_{frame_count}.jpg")
             cv2.imwrite(frame_path, frame)
-            if os.path.exists(frame_path):
-                if is_nsfw(frame_path):
-                    print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
-                    move_nsfw_file(frame_path, frame_count)
-                    continue
 
-                caption = generate_image_caption(frame_path)
-                captions.append(caption)
-                print(f"🖼️ Processed frame {frame_count}: {caption}")
-        
+            if is_nsfw(frame_path):
+                print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
+                move_nsfw_file(frame_path, frame_count)
+                nsfw_detected = True
+                break  # Stop checking further frames
+
         frame_count += 1
-    
+
     cap.release()
     
-    if captions:
-        combined_caption = " ".join(captions)
-        if is_relevant_ad(combined_caption, category):
-            print(f"✅ {video_path} - Video approved under '{category}': {combined_caption}")
-        else:
-            print(f"❌ {video_path} - Video rejected under '{category}': {combined_caption}")
+    if not nsfw_detected:
+        print(f"✅ {video_path} - No NSFW content found, processing for category relevance.")
+
 
 def process_folder(folder_path, category):
     """Process all images and videos in a folder and organize outputs."""
@@ -258,7 +281,7 @@ def process_folder(folder_path, category):
             if is_nsfw(file_path):
                 print(f"🚨 NSFW content detected in {filename}")
                 os.rename(file_path, os.path.join("output/nsfw", filename))
-                continue
+                continue  # Skip further processing
             text_prompt = generate_image_caption(file_path)
             if is_relevant_ad(text_prompt, category):
                 output_folder = "output/approved"
