@@ -4,13 +4,13 @@ import os
 import numpy as np
 from ultralytics import YOLO
 from PIL import Image
-from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForConditionalGeneration, AutoModelForImageClassification, AutoProcessor
+from transformers import CLIPProcessor, CLIPModel, BlipProcessor, BlipForConditionalGeneration
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch import nn, optim
 from nudenet import NudeClassifier
-from deepstack_sdk import ServerConfig, Detection
+
 
 
 # Load YOLOv8 model (pretrained on COCO dataset)
@@ -24,20 +24,42 @@ clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
 
-# # Load NSFW detection model
-nsfw_model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
-nsfw_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# Load NudeNet classifier
+nsfw_classifier = NudeClassifier()
+
+# # # Load NSFW detection model
+# nsfw_model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
+# nsfw_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # Load NSFW detection model
 # nsfw_model = predict.load_model("nsfw_mobilenet_v2.pb")  # Using a dedicated NSFW detection model
 
-# Load NSFW detection models
-nsfw_classifier = NudeClassifier()
+# Define NSFW labels (adjust based on dataset used for training CLIP)
+NSFW_LABELS = ["porn", "sexy", "nudity", "explicit"]
+SAFE_LABELS = ["safe", "clothing", "clean"]
+SIMILARITY_THRESHOLD = 0.5  # Adjustable threshold for NSFW detection
 
-# If using Deepstack (run Deepstack locally first: `docker run -d -p 5000:5000 deepquestai/deepstack`)
-DEEPSTACK_URL = "http://localhost:5000"
-deepstack_config = ServerConfig(DEEPSTACK_URL)
-deepstack_detector = Detection(deepstack_config)
+def is_nsfw(image_path):
+    """Use CLIP and NudeNet to classify NSFW content."""
+    # CLIP NSFW Detection
+    image = Image.open(image_path).convert("RGB")
+    inputs = clip_processor(text=NSFW_LABELS + SAFE_LABELS, images=image, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        outputs = clip_model(**inputs)
+    similarities = outputs.logits_per_image[0].softmax(dim=0)
+    nsfw_score = sum(similarities[:len(NSFW_LABELS)])  # NSFW labels
+    safe_score = sum(similarities[len(NSFW_LABELS):])  # Safe labels
+
+    # NudeNet Classification
+    nudenet_results = nsfw_classifier.classify(image_path)
+    nudenet_nsfw_prob = nudenet_results[image_path].get('porn', 0) + nudenet_results[image_path].get('sexy', 0)
+
+    # Final Decision: Require both CLIP and NudeNet to be over threshold
+    if nsfw_score > SIMILARITY_THRESHOLD and nudenet_nsfw_prob > 0.5:
+        print(f"🚨 NSFW detected in {image_path} (CLIP: {nsfw_score:.2f}, NudeNet: {nudenet_nsfw_prob:.2f})")
+        return True
+
+    return False
 
 def move_nsfw_file(frame_path, frame_number):
     """Move NSFW file to the NSFW folder with a unique name if it already exists."""
@@ -63,36 +85,25 @@ def move_nsfw_file(frame_path, frame_number):
 #     nsfw_score = probs[1]  # Assuming index 1 is NSFW probability
 #     return nsfw_score > 0.5  # Flag as NSFW if above 50%
 
-def is_nsfw(image_path):
-    """Detect if an image contains NSFW content."""
-    
-    # Step 1: NudeNet Classification
-    results = nsfw_classifier.classify(image_path)
-    nsfw_prob = results[image_path].get('porn', 0) + results[image_path].get('sexy', 0)
-
-    # Step 2: DeepStack NSFW (if available)
-    try:
-        response = deepstack_detector.detectObject(image_path, min_confidence=0.6)
-        ds_nsfw = any(obj['label'] == 'nudity' for obj in response["predictions"])
-    except Exception:
-        ds_nsfw = False  # If DeepStack isn't running, ignore it.
-
-    # Step 3: Decision Based on Threshold
-    if nsfw_prob > 0.5 or ds_nsfw:
-        print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_prob:.2f})")
-        return True
-    
-    return False
-
-# NSFW Detection Function
 # def is_nsfw(image_path):
-#     """Detect if an image contains NSFW content using a specialized NSFW model."""
-#     predictions = predict.classify(nsfw_model, image_path)
-#     nsfw_score = predictions[image_path]['porn'] + predictions[image_path]['sexy']  # Summing probabilities
-#     if nsfw_score > 0.5:
-#         print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_score:.2f})")
-#         move_nsfw_file(image_path)
+#     """Detect if an image contains NSFW content."""
+    
+#     # Step 1: NudeNet Classification
+#     results = nsfw_classifier.classify(image_path)
+#     nsfw_prob = results[image_path].get('porn', 0) + results[image_path].get('sexy', 0)
+
+#     # Step 2: DeepStack NSFW (if available)
+#     try:
+#         response = deepstack_detector.detectObject(image_path, min_confidence=0.6)
+#         ds_nsfw = any(obj['label'] == 'nudity' for obj in response["predictions"])
+#     except Exception:
+#         ds_nsfw = False  # If DeepStack isn't running, ignore it.
+
+#     # Step 3: Decision Based on Threshold
+#     if nsfw_prob > 0.5 or ds_nsfw:
+#         print(f"🚨 NSFW content detected in {image_path} (Score: {nsfw_prob:.2f})")
 #         return True
+    
 #     return False
 
 # Define dataset class
@@ -108,37 +119,37 @@ class NSFWImageDataset(Dataset):
         return image, torch.tensor(label, dtype=torch.long)
     
 
-# Define training function
-def train_nsfw_model(data_dir, epochs=5, batch_size=16, lr=0.001):
-    """Fine-tune the NSFW classification model."""
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
+# # Define training function
+# def train_nsfw_model(data_dir, epochs=5, batch_size=16, lr=0.001):
+#     """Fine-tune the NSFW classification model."""
+#     transform = transforms.Compose([
+#         transforms.Resize((224, 224)),
+#         transforms.ToTensor()
+#     ])
     
-    dataset = NSFWImageDataset(data_dir, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+#     dataset = NSFWImageDataset(data_dir, transform=transform)
+#     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
-    model.classifier = nn.Linear(model.config.hidden_size, 2)  # Adjust for binary classification
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+#     model = AutoModelForImageClassification.from_pretrained("openai/clip-vit-base-patch32")
+#     model.classifier = nn.Linear(model.config.hidden_size, 2)  # Adjust for binary classification
+#     criterion = nn.CrossEntropyLoss()
+#     optimizer = optim.Adam(model.parameters(), lr=lr)
     
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for images, labels in dataloader:
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs.logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
+#     model.train()
+#     for epoch in range(epochs):
+#         total_loss = 0.0
+#         for images, labels in dataloader:
+#             optimizer.zero_grad()
+#             outputs = model(images)
+#             loss = criterion(outputs.logits, labels)
+#             loss.backward()
+#             optimizer.step()
+#             total_loss += loss.item()
+#         print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
     
-    # Save trained model
-    model.save_pretrained("nsfw_trained_model")
-    print("✅ Model training completed and saved.")
+#     # Save trained model
+#     model.save_pretrained("nsfw_trained_model")
+#     print("✅ Model training completed and saved.")
 
 # Example usage for training
 # Uncomment this to train the NSFW model with your dataset
@@ -241,32 +252,33 @@ def is_relevant_ad(caption, category):
     return similarity_score >= SIMILARITY_THRESHOLD
 
 def process_video(video_path, category):
-    """Extract frames from video and analyze content."""
+    """Extract frames from video and analyze content frame by frame."""
     cap = cv2.VideoCapture(video_path)
     frame_count = 0
-    nsfw_detected = False
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30  # Default to 30 FPS if unknown
+
+    print(f"📹 Processing {video_path} - Total frames: {total_frames}, FPS: {fps}")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            break
+            break  # Stop if no frame is read
+
+        frame_path = os.path.join("output/frames", f"{os.path.basename(video_path)}_frame_{frame_count}.jpg")
+        cv2.imwrite(frame_path, frame)
+
+        # 🔍 Check for NSFW content
+        if is_nsfw(frame_path):
+            print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
+            move_nsfw_file(frame_path, frame_count)
         
-        if frame_count % 30 == 0:  # Process one frame per second (assuming 30 FPS)
-            frame_path = os.path.join("output/frames", f"{os.path.basename(video_path)}_frame_{frame_count}.jpg")
-            cv2.imwrite(frame_path, frame)
-
-            if is_nsfw(frame_path):
-                print(f"🚨 NSFW content detected in {video_path} - Frame {frame_count}")
-                move_nsfw_file(frame_path, frame_count)
-                nsfw_detected = True
-                break  # Stop checking further frames
-
-        frame_count += 1
+        frame_count += 1  # Process **every** frame (not just every 30th)
 
     cap.release()
-    
-    if not nsfw_detected:
-        print(f"✅ {video_path} - No NSFW content found, processing for category relevance.")
+    print(f"✅ {video_path} - Processing complete.")
+
+
 
 
 def process_folder(folder_path, category):
